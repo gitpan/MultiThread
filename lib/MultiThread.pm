@@ -10,7 +10,7 @@
 
 package MultiThread;
 
-our $VERSION = '0.06';
+our $VERSION = '0.07';
 
 package MultiThread::Base;
 
@@ -288,7 +288,7 @@ sub start_pipeline
 		my $t = threads->create(\&MultiThread::Base::worker, $self, $worker, $inputq, $outputq);
 
 		$inputq = $outputq;
-		push @{ $$self{Threads} }, $t;
+		push (@{ $$self{Threads} }, $t) if ($t);
 	}
 
 	$$self{Responses} = $outputq;
@@ -445,7 +445,7 @@ sub start_pool
 	{
 		my $t = threads->create(\&MultiThread::Base::worker, $self, $entrypoint, $inputq, $outputq);
 
-		push @{ $$self{Threads} }, $t;
+		push (@{ $$self{Threads} }, $t) if ($t);
 	}
 
 	return 1;
