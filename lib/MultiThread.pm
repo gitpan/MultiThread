@@ -10,7 +10,7 @@
 
 package MultiThread;
 
-our $VERSION = '0.07';
+our $VERSION = '0.8';
 
 package MultiThread::Base;
 
@@ -151,12 +151,11 @@ sub get_response
 }
 
 
-
 package MultiThread::Pipeline;
 
 =head1 MultiThread::Pipeline
 
-  use MultiThread::WorkerPool;
+  use MultiThread;
 
   my $pipeline = MultiThread::Pipeline->new( Pipeline => [ \&add_one, \&add_two ] );
 
@@ -176,7 +175,7 @@ package MultiThread::Pipeline;
   # workloads or long-running processes. Simply compare TicketNumbers 
   # as strings, and you'll be safe.
 
-  while ( $pipeline->pending_response )
+  while ( $pipeline->pending_responses )
   {
 	# get_response has a NoWait => 1 option for non-blocking reads
 	# if you'd rather write a polling loop instead.
@@ -239,6 +238,20 @@ use Data::Dumper;
 
 use Storable qw(freeze thaw);
 
+=head2 new
+
+Create a new MultiThread::Pipeline object.
+
+=head3 Pipeline
+
+This required parameter takes an arrayref of coderefs which represent the pipeline. 
+A single thread will be started for each coderef, and they will be daisychained together
+in the order given in the array. The first sub will consume the original request,
+and the last sub in the chain will return its results to the caller.
+
+=cut
+
+
 sub new
 {
 
@@ -298,13 +311,11 @@ sub start_pipeline
 
 
 
-
 package MultiThread::WorkerPool;
-
 
 =head1 MultiThread::WorkerPool
 
-  use MultiThread::WorkerPool;
+  use MultiThread;
 
   my $workerpool = MultiThread::WorkerPool->new( EntryPoint => \&add_one );
 
@@ -324,7 +335,7 @@ package MultiThread::WorkerPool;
   # workloads or long-running processes. Simply compare TicketNumbers 
   # as strings, and you'll be safe.
 
-  while ( $workerpool->pending_response )
+  while ( $workerpool->pending_responses )
   {
 	# get_response has a NoWait => 1 option for non-blocking reads
 	# if you'd rather write a polling loop instead.
@@ -389,6 +400,11 @@ start an equal number of workers. If it incorrectly detects CPU count for your m
 or if you know it's safe to start more or less, you can use this parameter 
 to do so.
 
+=head3 EntryPoint
+
+Pass in a sub reference to the initial sub to be called in each thread. This sub will
+be called for each item on the queue, and will run in parallel with itself. 
+
 =cut
 
 sub new
@@ -425,7 +441,8 @@ sub new
 
 }
 
-# I think this can be combined with MultiThread::Pipeline::start_pipeline. They're very similar.
+# I think this can be combined with MultiThread::Pipeline::start_pipeline and moved to MultiThread::Base. 
+# They're very similar.
 sub start_pool
 {
 	my $self = shift;
@@ -457,11 +474,75 @@ sub get_CPU_count
 	return $procs ? $procs : 1; # In case cpu_count returns 0 or undef
 }
 
+=head1 COMMON INSTANCE METHODS
+
+Both MultiThread::WorkerPool and MultiThread::Pipeline derive from MultiThread::Base,
+so they share a number of methods. 
+
+=head2 pending_responses
+
+Returns a boolean signifying whether there are still outstanding requests to be
+processed. This will return true until the last response has been collected.
+
+This method has no 
+
+=head2 send_request 
+
+This enqueues a request for processing. It takes no arguments of its own; all arguments 
+given will be passed directly to the subs you provide as @_. Call this exactly as you 
+would call your worker/pipeline methods directly. Just remember that any arguments 
+given must be serializable by the Storable module.
+
+This sub returns a unique ticket number (unique within the scope of the current instance). 
+This ticket number will be present in the response as well, so you can match up the 
+request with the response ticket if you need to.
+
+=head2 get_response
+
+When worker subs finish their work, their return values are put back onto a response queue
+for collection. Call this method on your WorkerPool or Pipeline object to retrieve the
+return tickets, one at a time. 
+
+The value returned is not only the return value of the worker thread. It is a hash containing
+TicketNumber, OriginalRequest, Response, and Exception. 
+
+=head3 Exception
+
+If the Pipeline or WorkerPool die()'s, this will be set to the die() message. This is so that
+a single request's problem does not prevent other requests from running to completion. 
+
+I do not provide a facility for allowing one request to kill the whole program because there's 
+no way of knowing the state of each request at the time the program died. If you really want 
+that behavior, do something like this in your get_response loop:
+
+  die($$ticket{Exception}) if ($$ticket{Exception});
+
+
+=head3 OriginalRequest
+
+The original request as given to send_request. This is necessary because the Request
+is set to the return value of each sub for use in Pipelining. 
+
+=head3 Response 
+
+The return value of the final sub in a Pipeline or the Worker in a WorkerPool. 
+
+=head3 TicketNumber
+
+The request number assigned to the request and returned to the caller of send_request. This
+number persists throughout the process for the purpose of matching up the response with the
+request. 
+
+
 =head1 BUGS
 
 Be careful that you're passing serializable data types that can be freeze()'d and thaw()'d. 
 These modules make extensive use of Thread::Queue, which requires all structures
 be serialized before being passed onto the queues.
+
+MultiThread::Pipeline needs a built-in way to allow each step to have its own WorkerPool.
+(Thanks for the idea, Aaron!) 
+
 
 =head1 AUTHOR
 

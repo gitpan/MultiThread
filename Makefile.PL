@@ -14,6 +14,8 @@ WriteMakefile(
     PREREQ_PM => {
         'Test::More' => 0,
         'Sys::CPU' => '0.40',
+        'threads' => 0,
+        'Storable' => 0
     },
     dist                => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
     clean               => { FILES => 'MultiThread-*' },
