@@ -10,7 +10,7 @@
 
 package MultiThread;
 
-our $VERSION = '0.8';
+our $VERSION = '0.9';
 
 package MultiThread::Base;
 
@@ -40,12 +40,25 @@ sub new
 	share($$self{Shutdown});
 	share($$self{Responses});
 
-	$$self{Threads} = [];
+	$$self{Threads} = [];      
 
 	$self = bless($self, $class);
 
 	return $self;
 
+}
+
+sub _request_queue
+{
+        my $self = shift;
+        return $$self{Requests};
+}
+
+
+sub _response_queue
+{
+        my $self = shift;
+        return $$self{Responses};
 }
 
 sub shutdown
@@ -85,16 +98,19 @@ sub worker
 		{
 
 			$ticket = thaw($ticket);
+			
+			#printf ("%s thr %d request: %s", 
+			#        ref($self), threads->tid, Dumper($$ticket{Request}) );
 
-			my $resp = eval { $workersub->( @{ $$ticket{Request} }) };
+			my @resp = eval { $workersub->( @{ $$ticket{Request} }) };
 
 			my $exception = $@ if $@;
 
-			$$ticket{Response} = $resp;
-			$$ticket{Request} = [$resp]; # in case we're sending this downstream
+			$$ticket{Response} = \@resp;
+			$$ticket{Request} = \@resp; # in case we're sending this downstream
 			$$ticket{Exception} = $exception;
 
-			$resp = freeze( $ticket );
+			my $resp = freeze( $ticket );
 
 			$outputq->enqueue( $resp );
 
@@ -156,8 +172,9 @@ package MultiThread::Pipeline;
 =head1 MultiThread::Pipeline
 
   use MultiThread;
-
-  my $pipeline = MultiThread::Pipeline->new( Pipeline => [ \&add_one, \&add_two ] );
+  
+  my $pool = MultiThread::WorkerPool->new( EntryPoint => \&add_one );
+  my $pipeline = MultiThread::Pipeline->new( Pipeline => [ $pool, \&add_two ] );
 
   # Push 10 requests into the queue for processing.
   # Worker processing will begin immediately.
@@ -181,7 +198,7 @@ package MultiThread::Pipeline;
 	# if you'd rather write a polling loop instead.
 	
   	my $ticket = $pipeline->get_response; # or get_response( NoWait => 1)
-  	printf "Answer was %s\n", $$ticket{Response};
+  	printf "Answer was %s\n", $$ticket{Response}->[0];
   }
 
   $pipeline->shutdown;
@@ -201,24 +218,24 @@ package MultiThread::Pipeline;
 =head1 PURPOSE
 
 This module implements a Pipeline multithreading model. Several concurrent
-threads are started -- one for each subroutine in the pipeline. The subs
-are daisy-chained together by queues. The output queue of one sub is the input
-queue of the following sub. 
+threads are started -- one for each subroutine in the pipeline. The subs and
+other MultiThread objects are daisy-chained together by queues. The output queue 
+of one step in the pipeline is the input queue of the following step. 
 
-In the contrived example above, add_one is the initial sub in the pipeline. It takes the request
+In the contrived example above, add_one is run by a WorkerPool object, and the
+WorkerPool object is placed first in the pipeline. It takes the request
 and adds one to it, returning the result. The result of add_one is fed as a request
 directly into add_two, which adds two and returns the result. Because add_two is the final
-sub in the chain, its output will be returned to the user via the get_response method. 
+step in the chain, its output will be returned to the user via the get_response method. 
 
 MultiThread::Pipeline is great when you have multiple steps that take different times to complete. 
 MultiThread::Pipeline handles the inter-step queuing for you, so you don't need to worry about
 what happens when one step outruns another. Each step simply processes asynchronously
 as quickly as it can. 
 
-One major consideration with Thread::Pipeline versus Thread::WorkerPool is that
-ThreadPipeline starts one thread for every sub in the pipeline. Depending on your work load
-and the nature of your processing, this may prove counterproductive. In that case, use Thread::WorkerPool
-instead.
+One major consideration with MultiThread::Pipeline versus MultiThread::WorkerPool is that
+MultiThread::Pipeline starts one thread for every sub in the pipeline, without regard for the
+number of CPUs on the system.
 
 =cut
 
@@ -242,12 +259,22 @@ use Storable qw(freeze thaw);
 
 Create a new MultiThread::Pipeline object.
 
+ MultiThread::Pipeline->new( %opts);
+
 =head3 Pipeline
 
-This required parameter takes an arrayref of coderefs which represent the pipeline. 
+This required parameter takes an arrayref of coderefs or other MultiThread objects
+which represent the pipeline. 
+
 A single thread will be started for each coderef, and they will be daisychained together
 in the order given in the array. The first sub will consume the original request,
 and the last sub in the chain will return its results to the caller.
+
+You can also mix in other pre-instantiated MultiThread objects, and they will 
+function as expected. In the synopsis example, the first step in the Pipeline is a 
+WorkerPool, the results of which are fed into the &add_two sub. You can theoretically 
+use as many MultiThread objects as you want in a Pipeline and they should all play nice 
+together.
 
 =cut
 
@@ -264,18 +291,31 @@ sub new
 		return undef;
 	}
 
+	my $self = $class->SUPER::new;	
+	$$self{Pipeline} = $opts{Pipeline};
+	
 	my %defaults = (
 	);
 
-
-	my $self = $class->SUPER::new;
-	
 	map {
 		$opts{$_} = $defaults{$_} unless defined $opts{$_};
 	} keys %defaults;
+	
+	# Allow MultiThread objects to lead the PipeLine. This should work
+	# whether the object is a WorkerPool or another PipeLine. 
+	
+	#printf ("First Pipeline ref is a %s\n", ref ($$self{Pipeline}[0]));
+	
+	if (ref ($$self{Pipeline}[0]) =~ /^MultiThread/ )
+	{
+	        $$self{Requests} = $$self{Pipeline}[0]->_request_queue;
+	}
+	elsif ( ref($$self{Pipeline}[0]) eq 'CODE' )
+	{
+        	$$self{Requests} = Thread::Queue->new();
+        }
+        
 
-	$$self{Requests} = Thread::Queue->new();
-	$$self{Pipeline} = $opts{Pipeline};
 
 	$self = bless($self, $class);
 
@@ -285,28 +325,102 @@ sub new
 
 }
 
+# Bridge the output and input queues of two back-to-back MultiThread::* objects.
+# Because the objects are already constructed, we can't dictate the queues they 
+# use internally. This sub will run in its own thread and will be inserted 
+# automatically into the pipeline wherever two MultiThread objects are 
+# back to back.
+sub _bridge_queues
+{
+        #print "Bridging values: " . Dumper(\@_);
+        return (@_);
+}
+
 sub start_pipeline
 {
 	my $self = shift;
 	my $entrypoints = shift;
 
 	my ($inputq, $outputq);
+	my (@newentries);
+
+        my $nextworker = 0;
+        foreach my $step ( @{$entrypoints} )
+        {
+                $nextworker++;
+                push @newentries, $step;
+                
+                if ( ref($step) =~ /^MultiThread/ and ref( $entrypoints->[$nextworker] ) =~ /^MultiThread/ ) 
+                {
+                        #print "Detected back-to-back MultiThread objects. Inserting bridge...\n";
+                        push @newentries, \&_bridge_queues;
+                }
+        }
+        
+        #print "New pipeline: " . Dumper(\@newentries);
+        
+        $entrypoints = \@newentries;
 
 	$inputq = $$self{Requests};
 
+        $nextworker = 0;
 	foreach my $worker (@{$entrypoints})
 	{
-		$outputq = Thread::Queue->new;
-		
-		my $t = threads->create(\&MultiThread::Base::worker, $self, $worker, $inputq, $outputq);
+	        $nextworker++;
+	        #printf "Worker is a %s\n", ref($worker);
+	        if (ref($worker) eq 'CODE')
+	        {
+	                # We need to look ahead in the pipeline to see if the next 
+	                # object to be chained in has an existing input queue. If so,
+	                # we need to use that as our current-item outputq.
+	                
+	                if ( defined $entrypoints->[$nextworker] and ref( $entrypoints->[$nextworker] ) =~ /^MultiThread/ )
+	                {
+	                        $outputq = $entrypoints->[$nextworker]->_request_queue;
+	                        #print "Got outputq $outputq\n";
+	                }
+	                else
+	                {
+		                $outputq = Thread::Queue->new;
+		        }
+		        
+        		my $t = threads->create(\&MultiThread::Base::worker, $self, $worker, $inputq, $outputq);
+        		push (@{ $$self{Threads} }, $t) if ($t);        		
+		}
+		elsif ( ref($worker) =~ '^MultiThread' )
+		{
+		        # Next worker will NEVER be a MultiThread object 
+		        # because we re-wrote the pipeline to break up MT objects
+		        # with a _bridge_queues CODEREF. 
+		        
+		        $outputq = $worker->_response_queue;
+		}
 
 		$inputq = $outputq;
-		push (@{ $$self{Threads} }, $t) if ($t);
 	}
 
 	$$self{Responses} = $outputq;
 
 	return 1;
+}
+
+# In a Pipeline situation where the Pipeline may contain other MultiThread::* 
+# objects, we need to shut them down first before shutting down the parent 
+# structures. Otherwise we'll be leaking threads like crazy.
+
+sub shutdown
+{
+        my $self = shift;
+        
+        foreach my $worker (@{ $self->{Pipeline} } )
+        {
+                if ( ref($worker) =~ /^MultiThread/ )
+                {
+                        $worker->shutdown;
+                }        
+        }
+        
+        return $self->SUPER::shutdown;
 }
 
 
@@ -341,7 +455,7 @@ package MultiThread::WorkerPool;
 	# if you'd rather write a polling loop instead.
 	
   	my $ticket = $workerpool->get_response; # or get_response( NoWait => 1)
-  	printf "Answer was %s\n", $$ticket{Response};
+  	printf "Answer was %s\n", $$ticket{Response}->[0];
   }
 
   $workerpool->shutdown;
@@ -362,7 +476,7 @@ in parallel using the sub provided.
 
 MultiThread::WorkerPool is ideal when you have many items that must all be processed 
 similarly, as quickly as possible. Simply write the sub that will handle the processing
-and hand it off to Thread::WorkerPool to run several instances of your sub 
+and hand it off to MultiThread::WorkerPool to run several instances of your sub 
 to process your work items. 
 
 All items are put onto a single work queue, and the first available thread will
@@ -390,7 +504,9 @@ use Data::Dumper;
 
 =head2 new
 
-  Thread::WorkerPool->new( %opts );
+Create a new MultiThread::WorkerPool object.
+
+  MultiThread::WorkerPool->new( %opts );
 
 =head3 MaxWorkers
 
@@ -432,6 +548,8 @@ sub new
 
 	$$self{EntryPoint} = $opts{EntryPoint};
 	$$self{MaxWorkers} = $opts{MaxWorkers};
+	
+	#printf "Starting %d worker threads.\n", $$self{MaxWorkers};
 
 	$self = bless($self, $class);
 
@@ -439,6 +557,18 @@ sub new
 
 	return $self;
 
+}
+
+=head1 worker_count
+
+Returns the number of worker threads in this WorkerPool instance.
+
+=cut
+
+sub worker_count
+{
+        my $self = shift;
+        return $self->{MaxWorkers};
 }
 
 # I think this can be combined with MultiThread::Pipeline::start_pipeline and moved to MultiThread::Base. 
@@ -484,18 +614,8 @@ so they share a number of methods.
 Returns a boolean signifying whether there are still outstanding requests to be
 processed. This will return true until the last response has been collected.
 
-This method has no 
+This method takes no arguments.
 
-=head2 send_request 
-
-This enqueues a request for processing. It takes no arguments of its own; all arguments 
-given will be passed directly to the subs you provide as @_. Call this exactly as you 
-would call your worker/pipeline methods directly. Just remember that any arguments 
-given must be serializable by the Storable module.
-
-This sub returns a unique ticket number (unique within the scope of the current instance). 
-This ticket number will be present in the response as well, so you can match up the 
-request with the response ticket if you need to.
 
 =head2 get_response
 
@@ -525,7 +645,10 @@ is set to the return value of each sub for use in Pipelining.
 
 =head3 Response 
 
-The return value of the final sub in a Pipeline or the Worker in a WorkerPool. 
+The return values of the final sub in a Pipeline or the Worker in a WorkerPool. This will be an
+ARRAYREF because PERL subs can return arrays. You'll need to dereference it. Versions of MultiThread
+prior to 0.9 only handled a single return value, which is why dereferencing was not necessary prior to 
+that version.
 
 =head3 TicketNumber
 
@@ -533,15 +656,32 @@ The request number assigned to the request and returned to the caller of send_re
 number persists throughout the process for the purpose of matching up the response with the
 request. 
 
+=head2 send_request 
+
+This enqueues a request for processing. It takes no arguments of its own; all arguments 
+given will be passed directly to the subs you provide as @_. Call this exactly as you 
+would call your worker/pipeline methods directly. Just remember that any arguments 
+given must be serializable by the Storable module.
+
+This sub returns a unique ticket number (unique within the scope of the current instance). 
+This ticket number will be present in the response as well, so you can match up the 
+request with the response ticket if you need to.
+
+=head2 shutdown
+
+Tell the WorkerPool or Pipeline that it should finish its pending processing, stop the worker 
+processes, and exit. Shutdown will wait for all threads to exit before returning to the caller.
+In cases of nested objects, e.g. Pipelines containing WorkerPools, the parent object will call
+shutdown() on its child MultiThread objects as well.
+
+=cut
+
 
 =head1 BUGS
 
 Be careful that you're passing serializable data types that can be freeze()'d and thaw()'d. 
 These modules make extensive use of Thread::Queue, which requires all structures
 be serialized before being passed onto the queues.
-
-MultiThread::Pipeline needs a built-in way to allow each step to have its own WorkerPool.
-(Thanks for the idea, Aaron!) 
 
 
 =head1 AUTHOR
